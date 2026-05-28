@@ -183,6 +183,13 @@ type Client struct {
 
 	SendReportingTokens bool
 
+	// AutoRetryDMOnCapped, when true, retries 1:1 DMs rejected with ErrMessageCapped
+	// (475) using device_fanout=false after invalidating the recipient's
+	// userDevicesCache. Only applies to DefaultUserServer / HiddenUserServer.
+	// NEVER applied to groups/broadcasts (device_fanout=false on a group induces a
+	// ban loop).
+	AutoRetryDMOnCapped bool
+
 	BackgroundEventCtx context.Context
 
 	phoneLinkingCache *phoneLinkingCache

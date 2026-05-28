@@ -449,6 +449,25 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		// Callers must NOT retry on ErrPrivacyTokenMissing — retrying
 		// counts as another reach-out and worsens the time-lock.
 		err = classifyServerError(errorCode)
+		if cli.AutoRetryDMOnCapped && errors.Is(err, ErrMessageCapped) && !req.Peer &&
+			(to.Server == types.DefaultUserServer || to.Server == types.HiddenUserServer) {
+			retryStart := time.Now()
+			cli.Log.Warnf("Got message_capped (475) for %s, retrying with device_fanout=false", to)
+			var retryResp SendResponse
+			retryResp, err = cli.retrySendDMWithoutFanout(ctx, ownID, to, req, message, extraParams, &resp.DebugTimings)
+			resp.DebugTimings.Retry = time.Since(retryStart)
+			if err == nil {
+				if !retryResp.Timestamp.IsZero() {
+					resp.Timestamp = retryResp.Timestamp
+				}
+				if retryResp.ServerID != 0 {
+					resp.ServerID = retryResp.ServerID
+				}
+				cli.Log.Infof("Retry sendDM(device_fanout=false) for %s succeeded", to)
+				return
+			}
+			cli.Log.Warnf("Retry sendDM(device_fanout=false) for %s failed: %v", to, err)
+		}
 	}
 	expectedPHash := ag.OptionalString("phash")
 	if len(expectedPHash) > 0 && phash != expectedPHash {
@@ -743,10 +762,11 @@ func (cli *Client) sendNewsletter(
 }
 
 type nodeExtraParams struct {
-	botNode         *waBinary.Node
-	metaNode        *waBinary.Node
-	additionalNodes *[]waBinary.Node
-	addressingMode  types.AddressingMode
+	botNode             *waBinary.Node
+	metaNode            *waBinary.Node
+	additionalNodes     *[]waBinary.Node
+	addressingMode      types.AddressingMode
+	disableDeviceFanout bool
 }
 
 func (cli *Client) sendGroup(
@@ -901,6 +921,68 @@ func (cli *Client) sendDM(
 	}
 
 	return phash, data, nil
+}
+
+// retrySendDMWithoutFanout re-sends a 1:1 DM with device_fanout=false after the
+// server rejected the first attempt with ErrMessageCapped (475). The recipient's
+// userDevicesCache entry is cleared so the new stanza is built from a fresh device.
+// The original message ID is reused. Caller must ensure to.Server is
+// DefaultUserServer or HiddenUserServer and !req.Peer; device_fanout=false on
+// groups/broadcasts triggers a ban loop and MUST NOT be used.
+//
+// Returns SendResponse with ServerID and Timestamp from the retry ack, or an
+// error if the retry attempt itself failed.
+func (cli *Client) retrySendDMWithoutFanout(
+	ctx context.Context,
+	ownID, to types.JID,
+	req SendRequestExtra,
+	message *waE2E.Message,
+	extraParams nodeExtraParams,
+	debugTimings *MessageDebugTimings,
+) (resp SendResponse, err error) {
+	resp.ID = req.ID
+	resp.Sender = ownID
+
+	cli.userDevicesCacheLock.Lock()
+	delete(cli.userDevicesCache, to)
+	cli.userDevicesCacheLock.Unlock()
+
+	extraParams.disableDeviceFanout = true
+
+	respChan := cli.waitResponse(req.ID)
+	_, _, sendErr := cli.sendDM(ctx, ownID, to, req.ID, message, debugTimings, extraParams)
+	if sendErr != nil {
+		cli.cancelResponse(req.ID, respChan)
+		err = sendErr
+		return
+	}
+
+	var respNode *waBinary.Node
+	var timeoutChan <-chan time.Time
+	if req.Timeout > 0 {
+		timeoutChan = time.After(req.Timeout)
+	} else {
+		timeoutChan = make(<-chan time.Time)
+	}
+	select {
+	case respNode = <-respChan:
+	case <-timeoutChan:
+		cli.cancelResponse(req.ID, respChan)
+		err = ErrMessageTimedOut
+		return
+	case <-ctx.Done():
+		cli.cancelResponse(req.ID, respChan)
+		err = ctx.Err()
+		return
+	}
+
+	ag := respNode.AttrGetter()
+	resp.ServerID = types.MessageServerID(ag.OptionalInt("server_id"))
+	resp.Timestamp = ag.UnixTime("t")
+	if errorCode := ag.Int("error"); errorCode != 0 {
+		err = classifyServerError(errorCode)
+	}
+	return
 }
 
 func getTypeFromMessage(msg *waE2E.Message) string {
@@ -1191,6 +1273,9 @@ func (cli *Client) prepareMessageNode(
 		"id":   id,
 		"type": msgType,
 		"to":   to,
+	}
+	if extraParams.disableDeviceFanout {
+		attrs["device_fanout"] = false
 	}
 	// TODO this is a very hacky hack for announcement group messages, why is it pn anyway?
 	if extraParams.addressingMode != "" {
